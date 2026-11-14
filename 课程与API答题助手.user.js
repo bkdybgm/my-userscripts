@@ -133,7 +133,7 @@
       result.push(doc);
 
       doc.querySelectorAll('iframe').forEach(frame => {
-        if (!visible(frame) ||
+        if (!visible(frame) || frame.id === 'panView' ||
             frame.closest('.edui-editor')) return;
 
         try {
@@ -3389,6 +3389,8 @@
   let skippedVideoPage = '';
   let skipVideoTimer = null;
 
+  let lastPanScanAt = 0;
+
   function coordinator() {
     if (!TOP || !root || document.hidden) return;
 
@@ -3600,6 +3602,9 @@
       (panFrames.length || pptSelected) &&
       !panTaskDone
     ) {
+      if (Date.now() - lastPanScanAt < 5000) return;
+      lastPanScanAt = Date.now();
+
       const areas = [];
       const seenDocs = new Set();
       let inaccessible = false;
@@ -3631,14 +3636,15 @@
         for (const el of doc.querySelectorAll(
           'div,section,article,main'
         )) {
+          if (
+            el.clientHeight < 100 ||
+            el.clientWidth < 200 ||
+            el.scrollHeight <= el.clientHeight + 10
+          ) continue;
+
           const style = doc.defaultView.getComputedStyle(el);
 
-          if (
-            el.clientHeight >= 100 &&
-            el.clientWidth >= 200 &&
-            el.scrollHeight > el.clientHeight + 10 &&
-            /(auto|scroll)/.test(style.overflowY)
-          ) {
+          if (/(auto|scroll)/.test(style.overflowY)) {
             areas.push(el);
           }
         }
@@ -3962,7 +3968,7 @@
   }, 1000);
 
   // 此处只检查页面、弹窗和完成状态，不是网络检测。
-  setInterval(fastCheck, 500);
+  setInterval(fastCheck, 2000);
 
   document.addEventListener('visibilitychange', () => {
     if (!document.hidden) fastCheck();
