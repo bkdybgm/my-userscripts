@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         课程与API答题助手（60秒网络恢复版）
 // @namespace    local.course.assistant
-// @version      1.5.1
+// @version      1.5.6
 // @description  字体解码、批量答题、填空、提交确认、下一节、网络异常60秒检测
 // @match        https://kmcc.tuozhikj.com/*
 // @match        https://*.chaoxing.com/*
@@ -17,6 +17,7 @@
 // @downloadURL https://update.greasyfork.org/scripts/604231/%E8%AF%BE%E7%A8%8B%E4%B8%8EAPI%E7%AD%94%E9%A2%98%E5%8A%A9%E6%89%8B%EF%BC%8860%E7%A7%92%E7%BD%91%E7%BB%9C%E6%81%A2%E5%A4%8D%E7%89%88%EF%BC%89.user.js
 // @updateURL https://update.greasyfork.org/scripts/604231/%E8%AF%BE%E7%A8%8B%E4%B8%8EAPI%E7%AD%94%E9%A2%98%E5%8A%A9%E6%89%8B%EF%BC%8860%E7%A7%92%E7%BD%91%E7%BB%9C%E6%81%A2%E5%A4%8D%E7%89%88%EF%BC%89.meta.js
 // ==/UserScript==
+/* global md5 */
 
 (() => {
   'use strict';
@@ -52,6 +53,7 @@
     next: true,
     reading: true,
     training: true,
+    autoCourse: true,
     base: 'https://api.deepseek.com',
     model: 'deepseek-flash',
     key: '',
@@ -74,7 +76,6 @@
   let stableKey = '';
   let stableAt = 0;
   let navigation = null;
-  let mutationTimer = null;
 
   function say(text) {
     message = String(text);
@@ -466,6 +467,12 @@
   }
 
   // ==================== 完成状态 ====================
+
+  function hasPendingTasks(doc = document) {
+    return [...doc.querySelectorAll(
+      '.ans-job-icon[aria-label="任务点未完成"]'
+    )].some(visible);
+  }
 
   function taskDone(doc = document) {
     const clean = value => String(value || '')
@@ -993,8 +1000,8 @@
   }
 
   function blankFields(el) {
-    const rows = [...el.querySelectorAll(
-      '.stem_answer .Answer'
+      const rows = [...el.querySelectorAll(
+          '.stem_answer .Answer, .Zy_ulTk .blankItemDiv'
     )];
 
     if (rows.length) {
@@ -1285,13 +1292,12 @@
       );
   }
 
-  function stopped() {
+   function stopped() {
     const c = cfg();
 
     return !c.enabled ||
       !c.answer ||
-      reviewed() ||
-      (c.next && taskDone());
+      reviewed();
   }
 
   async function fill(question, answers) {
@@ -1672,20 +1678,70 @@
             String(result.id) === String(item.id)
           );
 
-          const valid = found.length === 1
+                    let valid = found.length === 1
             ? validateAnswer(item.question, found[0])
             : null;
+
+          let guessed = false;
+
+          // 批量请求没有得到答案时，再单独请求一次。
+          if (!valid?.answers.length) {
+            showProgress(
+              `第 ${item.id + 1} 题未取得答案，正在单独重试。`
+            );
+
+            try {
+              const retryResults = await askBatch(c, [item]);
+
+              if (stopped()) return;
+
+              const retried = retryResults.filter(result =>
+                String(result.id) === String(item.id)
+              );
+
+              valid = retried.length === 1
+                ? validateAnswer(item.question, retried[0])
+                : null;
+
+            } catch (error) {
+              if (stopped()) return;
+
+              console.warn(
+                `第 ${item.id + 1} 题单独重试失败：`,
+                error
+              );
+            }
+          }
+
+          // 仍然无答案时，仅对单选题使用第一个选项兜底。
+          if (!valid?.answers.length &&
+              item.question.kind === 'choice' &&
+              !multiple(item.question) &&
+              item.question.options.length > 0) {
+            const first = item.question.options[0];
+
+            valid = validateAnswer(item.question, {
+              answers: [first.letter],
+              explanation: '未取得确定答案，已选择第一个选项兜底。'
+            });
+
+            guessed = !!valid?.answers.length;
+          }
 
           if (!valid?.answers.length) {
             lines.set(
               item.id,
-              `第 ${item.id + 1} 题：未取得完整、确定的答案。`
+              `第 ${item.id + 1} 题：重试后仍无法作答，请手动处理。`
             );
             continue;
           }
 
           answers.set(item.id, valid);
-          GM_setValue(keys[item.id], valid);
+
+          // 兜底选择不是确定答案，不保存到答案缓存。
+          if (!guessed) {
+            GM_setValue(keys[item.id], valid);
+          }
 
           if (stopped()) return;
 
@@ -1883,6 +1939,10 @@
           <label>
             <input type="checkbox" data-k="training">
             训练展示页立即下一节
+          </label>
+          <label>
+            <input type="checkbox" data-k="autoCourse">
+            自动切换未完成课程
           </label>
 
           <button id="config">配置 API</button>
@@ -2187,6 +2247,597 @@
     return !hasContent && !hasEntry && !hasCaptcha;
   }
 
+  // 播放器明确提供的倍速中选最高值，每个视频只设置一次。
+  function useFastestAvailableRate(video) {
+    const player = video.closest('.video-js,.vjs-player');
+    if (!player) return;
+    const rates = [];
+    player.querySelectorAll('.vjs-playback-rate,.vjs-playback-rate-menu,[class*="playback-rate"]').forEach(menu => {
+      menu.querySelectorAll('li,button,span,[role="menuitem"],[role="menuitemradio"]').forEach(item => {
+        const match = (item.textContent || '').trim().replace(/\s+/g, '').match(/^(\d+(?:\.\d+)?)[xX倍]$/);
+        if (match && Number(match[1]) > 0) rates.push(Number(match[1]));
+      });
+    });
+    if (!rates.length) return;
+    const rate = Math.max(...rates), source = video.currentSrc || video.src || '';
+    const done = useFastestAvailableRate.done || (useFastestAvailableRate.done = new WeakMap());
+    const old = done.get(video);
+    if (old && old.rate === rate && old.source === source) return;
+    try { video.playbackRate = rate; if (Math.abs(video.playbackRate - rate) < 0.001) done.set(video, {rate, source}); }
+    catch (error) { console.warn('[课程助手] 设置倍速失败', error.message); }
+  }
+
+  // 页面已经完成3秒稳定检测后，只点击一次，避免循环打开课程。
+  function enterOnce(key, target, label) {
+    if (enterOnce.attempted === key) { statusNode.textContent = '已点击' + label + '，等待页面打开。'; return true; }
+    if (enterOnce.pending !== key) { enterOnce.pending = key; enterOnce.since = Date.now(); }
+    const wait = 3000 - (Date.now() - enterOnce.since);
+    if (wait > 0) { statusNode.textContent = '发现' + label + '，' + Math.ceil(wait / 1000) + '秒后进入。'; return true; }
+    enterOnce.attempted = key; statusNode.textContent = '正在进入' + label; target.click(); return true;
+  }
+
+  function extraRoutes(docs, active, identity) {
+    // 课程列表：以明确的“已完成/总数”进度区分，未显示进度的课程不推断。
+    const progressPattern = /任务点进度[：:]\s*(\d+)\s*\/\s*(\d+)/;
+    const listDoc = docs.find(doc => (doc.body?.textContent || '').replace(/\s+/g, '').includes('我学的课') && [...doc.querySelectorAll('span,div,p')].some(el => visible(el) && progressPattern.test(el.textContent || '')));
+    if (listDoc) {
+      if (!cfg().autoCourse) {
+        statusNode.textContent = '已关闭自动切换课程，可手动选择课程。';
+        return true;
+      }
+      const progress = [...listDoc.querySelectorAll('span,div,p')].filter(el => {
+        if (!visible(el) || !progressPattern.test(el.textContent || '')) return false;
+        if ([...(el.textContent || '').matchAll(/任务点进度[：:]\s*\d+\s*\/\s*\d+/g)].length !== 1) return false;
+        return ![...el.children].some(child => progressPattern.test(child.textContent || ''));
+      });
+      for (const item of progress) {
+        const m = (item.textContent || '').match(progressPattern);
+        if (!m || Number(m[2]) <= 0 || Number(m[1]) >= Number(m[2])) continue;
+        let card = item;
+        for (let depth = 0; card && card !== listDoc.body && depth < 8; depth++, card = card.parentElement) {
+          if ([...(card.textContent || '').matchAll(/任务点进度[：:]\s*\d+\s*\/\s*\d+/g)].length > 1) break;
+          const links = [...card.querySelectorAll('a[href]')].filter(link => {
+            if (!visible(link)) return false;
+            try { const u = new URL(link.getAttribute('href'), listDoc.baseURI); return u.protocol === 'https:' && (u.hostname === location.hostname || u.hostname === 'chaoxing.com' || u.hostname.endsWith('.chaoxing.com')) && !/\/(?:login|logout|search)(?:\/|$)/i.test(u.pathname); } catch { return false; }
+          });
+          const unique = new Map(links.map(link => [new URL(link.getAttribute('href'), listDoc.baseURI).href, link]));
+          if (unique.size === 1) { const [href, link] = [...unique.entries()][0]; return enterOnce('course|' + href, link, '未完成课程'); }
+        }
+        statusNode.textContent = '发现未完成课程，但无法确认课程入口，需要适配课程卡片。'; return true;
+      }
+      statusNode.textContent = '未发现带有未完成任务点进度的课程。'; return true;
+    }
+
+    // 课程目录：仅处理有橙色数字、且唯一匹配到小节入口的可见行。
+    const overview = docs.find(doc => /已完成任务点\s*[：:]\s*\d+\s*\/\s*\d+/.test(doc.body?.textContent || ''));
+    if (cfg().next && overview && !docs.some(doc => [...doc.querySelectorAll('video,audio,.questionLi')].some(visible) || controls(doc, [...SUBMIT, ...ENTRY]).length)) {
+      if (overview.readyState !== 'complete') { statusNode.textContent = '课程目录正在加载。'; return true; }
+      function orange(el) { if (!el || !visible(el)) return false; const m = getComputedStyle(el).backgroundColor.match(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/); return !!m && +m[1] >= 200 && +m[2] >= 70 && +m[2] <= 210 && +m[3] <= 140; }
+      const badges = [...overview.querySelectorAll('span,i,b,em,div')].filter(el => /^[1-9]\d{0,2}$/.test(textOf(el)) && visible(el) && (orange(el) || orange(el.parentElement))).filter(el => ![...el.children].some(child => /^[1-9]\d{0,2}$/.test(textOf(child)) && visible(child)));
+      if (!badges.length) { statusNode.textContent = '当前展开的目录中没有识别到未完成小节。'; return true; }
+      const badge = badges[0]; let row = badge;
+      for (let depth = 0; row && row !== overview.body && depth < 7; depth++, row = row.parentElement) {
+        if (badges.filter(item => row === item || row.contains(item)).length > 1) break;
+        const choices = [...row.querySelectorAll('a,[onclick],[role="button"]')].filter(el => visible(el) && !el.disabled && /^\d+(?:[.．]\d+)+\S/.test(textOf(el)));
+        const targets = choices.filter(el => !choices.some(other => other !== el && el.contains(other)));
+        if (targets.length === 1) return enterOnce('section|' + overview.URL + '|' + textOf(targets[0]), targets[0], '未完成小节：' + textOf(targets[0]));
+      }
+      statusNode.textContent = '发现未完成标记，但无法确认小节入口，需要适配目录结构。'; return true;
+    }
+
+    const hasWork = docs.some(doc => [...doc.querySelectorAll('video,audio,.questionLi')].some(visible) || controls(doc, [...SUBMIT, ...ENTRY]).length);
+    // 拓展阅读入口，明确允许跳过时等待3秒。
+    const readingEntry = docs.some(doc => /您的阅读总时长/.test(doc.body?.textContent || '') && controls(doc, ['去阅读']).length);
+    if (cfg().next && cfg().reading && readingEntry && !hasWork && !active.some(item => item.state === 'quiz' || item.state === 'video')) { scheduleNext('reading-entry|' + identity, 3000, '阅读入口页'); return true; }
+
+    // 确认只有上一节、且没有题目或播放器后尝试关闭当前标签页。
+    const previous = docs.some(doc => controls(doc, ['上一节','上一页','上一课']).length);
+    const next = docs.some(doc => controls(doc, NEXT).length);
+    if (cfg().next && document.readyState === 'complete' && previous && !next && !hasWork) {
+      const key = 'close|' + identity;
+      if (extraRoutes.closeKey !== key) { extraRoutes.closeKey = key; extraRoutes.closeAt = Date.now(); extraRoutes.closeTried = false; }
+      const wait = 3000 - (Date.now() - extraRoutes.closeAt);
+      if (wait > 0) { statusNode.textContent = '检测到只有上一节，' + Math.ceil(wait / 1000) + '秒后尝试关闭标签页。'; return true; }
+      if (!extraRoutes.closeTried) { extraRoutes.closeTried = true; window.close(); }
+      statusNode.textContent = '已尝试关闭标签页；如浏览器未允许，请手动关闭。'; return true;
+    }
+    extraRoutes.closeKey = ''; extraRoutes.closeTried = false;
+    return false;
+  }
+
+  // 由目录所在 frame 检测小节，避免主页面无法读取跨域 iframe。
+  function enterPendingSectionInCurrentFrame() {
+    const c = cfg();
+
+    if (
+      !c.enabled ||
+      !c.next ||
+      document.hidden ||
+      /\/studentstudy/i.test(location.pathname)
+    ) return false;
+
+    const hasWork =
+      [...document.querySelectorAll('video,audio,.questionLi')]
+        .some(visible) ||
+      controls(document, [...SUBMIT, ...ENTRY]).length > 0;
+
+    if (hasWork) return false;
+
+    const chapters = [
+      ...document.querySelectorAll('.chapter_item')
+    ].filter(visible);
+
+    if (!chapters.length) return false;
+
+    const pending = chapters.filter(item => {
+      const marker = item.querySelector('.catalog_points_yi');
+
+      if (!marker || !visible(marker)) return false;
+
+      const count = Number((marker.textContent || '').trim());
+
+      return Number.isFinite(count) && count > 0;
+    });
+
+    if (!pending.length) {
+      say('课程目录中暂未发现可见的未完成小节。');
+      report('blocked', 'directory-local');
+      return true;
+    }
+
+    const item = pending[0];
+
+    const title =
+      item.getAttribute('title') ||
+      item.querySelector('.clicktitle')?.textContent?.trim() ||
+      '未完成小节';
+
+    const key = location.href + '|' + (item.id || title);
+
+    if (enterPendingSectionInCurrentFrame.attempted === key) {
+      say('已点击小节：' + title + '，等待页面打开。');
+      report('blocked', 'directory-local');
+      return true;
+    }
+
+    if (enterPendingSectionInCurrentFrame.pending !== key) {
+      enterPendingSectionInCurrentFrame.pending = key;
+      enterPendingSectionInCurrentFrame.since = Date.now();
+    }
+
+    const remaining =
+      3000 - (Date.now() - enterPendingSectionInCurrentFrame.since);
+
+    if (remaining > 0) {
+      say(
+        '发现未完成小节：' + title + '\n' +
+        Math.ceil(remaining / 1000) + '秒后进入。'
+      );
+
+      report('blocked', 'directory-local');
+      return true;
+    }
+
+    // 先记录再点击，避免打开多个标签页。
+    enterPendingSectionInCurrentFrame.attempted = key;
+
+    say('正在进入未完成小节：' + title);
+    report('blocked', 'directory-local');
+
+    // 网站把 toOld(...) 绑定在整个 chapter_item 上。
+    item.click();
+    return true;
+  }
+
+  let directoryWasHidden = document.hidden;
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+      directoryWasHidden = true;
+      return;
+    }
+
+    if (!directoryWasHidden) return;
+    directoryWasHidden = false;
+
+    enterPendingSectionInCurrentFrame.pending = '';
+    enterPendingSectionInCurrentFrame.since = 0;
+    enterPendingSectionInCurrentFrame.attempted = '';
+  });
+
+      // ==================== 视频弹题处理 ====================
+
+  const videoQuizAttempts = new WeakMap();
+  let videoQuizBusy = false;
+
+  async function solveVideoQuiz(item) {
+    if (videoQuizBusy || !item || !visible(item)) return;
+
+    const c = cfg();
+
+    if (!c.enabled || !c.answer) {
+      say('检测到视频题目，自动答题已关闭。');
+      report('blocked', 'video-quiz');
+      return;
+    }
+
+    if (!c.base || !c.model || !c.key) {
+      say('视频题目需要 API，请先配置。');
+      report('blocked', 'video-quiz');
+      return;
+    }
+
+    const titleNode = item.querySelector('.tkItem_title');
+
+    const optionNodes = [
+      ...item.querySelectorAll('.ans-videoquiz-opt')
+    ];
+
+    if (!titleNode || optionNodes.length < 2) {
+      say('视频题目结构不完整，请手动答题。');
+      report('blocked', 'video-quiz');
+      return;
+    }
+
+    if (item.querySelector('img, canvas, svg')) {
+      say('视频题目包含图片，请手动作答。');
+      report('blocked', 'video-quiz');
+      return;
+    }
+
+    const signature = md5(JSON.stringify([
+      location.href,
+      titleNode.textContent,
+      optionNodes.map(node => node.textContent),
+      GM_getValue('course-helper-retry', 0)
+    ]));
+
+    // 同一题只自动处理一次，避免反复请求和重复提交。
+    if (videoQuizAttempts.get(item) === signature) return;
+
+    videoQuizAttempts.set(item, signature);
+    videoQuizBusy = true;
+
+    try {
+      say('检测到视频题目，正在读取题干…');
+      report('quiz', 'video-quiz');
+
+      const font = await prepareFont();
+
+      if (!cfg().enabled || !cfg().answer || !item.isConnected) {
+        return;
+      }
+
+      const options = optionNodes.map((node, index) => {
+        const label = node.querySelector('label') || node;
+        const raw = readText(label, font);
+
+        const match = raw.match(
+          /^([A-Za-z])\s*[、.．:：]/
+        );
+
+        return {
+          node,
+          letter: match
+            ? match[1].toUpperCase()
+            : String.fromCharCode(65 + index),
+          text: raw
+        };
+      });
+
+      const letters = options.map(option => option.letter);
+
+      if (new Set(letters).size !== letters.length) {
+        throw new Error('视频题目选项字母无法唯一识别');
+      }
+
+      const question = {
+        el: item,
+        kind: 'choice',
+        type: '视频单选或判断题',
+        title: readText(titleNode, font),
+        options,
+        fields: []
+      };
+
+      const cacheKey = questionKey(question, c);
+
+      let answer = validateAnswer(
+        question,
+        GM_getValue(cacheKey, null)
+      );
+
+      if (!answer?.answers.length) {
+        say('正在分析视频题目…');
+        report('quiz', 'video-quiz');
+
+        const results = await askBatch(c, [
+          { id: 0, question }
+        ]);
+
+        if (!cfg().enabled || !cfg().answer || !item.isConnected) {
+          return;
+        }
+
+        const found = results.filter(
+          result => String(result.id) === '0'
+        );
+
+        answer = found.length === 1
+          ? validateAnswer(question, found[0])
+          : null;
+
+        if (!answer?.answers.length) {
+          throw new Error('API 没有返回可用答案');
+        }
+
+        GM_setValue(cacheKey, answer);
+      }
+
+      if (answer.answers.length !== 1) {
+        throw new Error('视频单选题返回了多个答案');
+      }
+
+      const chosen = options.find(
+        option => option.letter === answer.answers[0]
+      );
+
+      const input = chosen?.node.querySelector(
+        'input[type="radio"]'
+      );
+
+      if (!input || input.disabled) {
+        throw new Error('无法操作视频题目选项');
+      }
+
+      if (!input.checked) {
+        input.click();
+      }
+
+      // 等待页面完成选中状态更新。
+      for (let i = 0; i < 5 && !input.checked; i++) {
+        await sleep(100);
+      }
+
+      if (!input.checked) {
+        throw new Error('无法确认视频题目已选中');
+      }
+
+      if (!cfg().submit) {
+        say(
+          '视频题目已选：' + answer.answers[0] +
+          '\n自动提交已关闭，请手动提交。'
+        );
+
+        report('blocked', 'video-quiz');
+        return;
+      }
+
+      if (questionNodes().length) {
+        throw new Error(
+          '同时存在其他题目，请手动提交视频题'
+        );
+      }
+
+      const targets = controls(document, ['提交']);
+
+      if (targets.length !== 1) {
+        throw new Error(
+          '无法唯一识别视频题目的提交按钮'
+        );
+      }
+
+      if (!cfg().enabled ||
+          !cfg().submit ||
+          !item.isConnected) {
+        return;
+      }
+
+      clickable(targets[0]).click();
+
+      say('已提交视频题目，等待弹窗关闭和播放恢复。');
+      report('blocked', 'video-quiz');
+
+    } catch (error) {
+      say(
+        '视频题目处理失败：' + error.message +
+        '\n可手动处理，或点击“重试填写/答题”。'
+      );
+
+      report('blocked', 'video-quiz');
+
+    } finally {
+      videoQuizBusy = false;
+    }
+  }
+
+      // 视频判断题答错后，尝试另一项。
+  const videoQuizCorrectionAttempts = new WeakSet();
+
+  function correctVideoQuiz(item) {
+    if (!item || !visible(item)) return false;
+
+    const c = cfg();
+
+    if (!c.enabled || !c.answer) return false;
+
+    // 只处理两个单选选项。
+    const options = [
+      ...item.querySelectorAll('.ans-videoquiz-opt')
+    ];
+
+    if (options.length !== 2) return false;
+
+    const inputs = options.map(option =>
+      option.querySelector('input[type="radio"]')
+    );
+
+    if (inputs.some(input => !input)) return false;
+
+    // 查找当前文档中可见的“回答错误”提示。
+    const errorVisible = [
+      ...document.querySelectorAll('div, span, p')
+    ].some(element => {
+      if (!visible(element)) return false;
+
+      const text = (element.textContent || '')
+        .replace(/\s+/g, '')
+        .trim();
+
+      // 避免把包含整个页面的父元素当作错误提示。
+      return text === '回答错误' || text === '回答错误！';
+    });
+
+    if (!errorVisible) return false;
+
+    // 一个弹题元素只纠正一次，防止循环点击。
+    if (videoQuizCorrectionAttempts.has(item)) {
+      say('视频题已尝试另一项，等待结果。');
+      report('blocked', 'video-quiz');
+      return true;
+    }
+
+    const selected = inputs.filter(input => input.checked);
+
+    if (selected.length !== 1) {
+      say('视频题回答错误，但无法确定当前选项，请手动处理。');
+      report('blocked', 'video-quiz');
+      return true;
+    }
+
+    const other = inputs.find(input => !input.checked);
+
+    if (!other || other.disabled) {
+      say('视频题回答错误，但另一选项无法点击，请手动处理。');
+      report('blocked', 'video-quiz');
+      return true;
+    }
+
+    videoQuizCorrectionAttempts.add(item);
+    other.click();
+
+    if (!other.checked) {
+      say('尝试选择另一项失败，请手动处理。');
+      report('blocked', 'video-quiz');
+      return true;
+    }
+
+    if (!c.submit) {
+      say('回答错误，已选另一项；请手动提交。');
+      report('blocked', 'video-quiz');
+      return true;
+    }
+
+    const targets = controls(document, ['提交']);
+
+    if (targets.length !== 1) {
+      say('已选另一项，但无法唯一确定提交按钮，请手动提交。');
+      report('blocked', 'video-quiz');
+      return true;
+    }
+
+    clickable(targets[0]).click();
+    say('回答错误，已选择另一项并提交，等待结果。');
+    report('blocked', 'video-quiz');
+    return true;
+  }
+
+
+  // 同一组任务点中，仅允许第一个未完成的媒体自动播放。
+  function mayPlayAttachment() {
+    let currentWindow = window;
+    let attachment = null;
+
+    // 找到包住当前播放器 iframe 的任务点容器。
+    for (let depth = 0; depth < 6; depth++) {
+      let frame;
+
+      try {
+        frame = currentWindow.frameElement;
+      } catch {
+        return false;
+      }
+
+      if (!frame) break;
+
+      attachment = frame.closest('.ans-attach-ct');
+
+      if (attachment) break;
+
+      try {
+        currentWindow = currentWindow.parent;
+      } catch {
+        return false;
+      }
+    }
+
+    // 不是这种任务点结构，沿用原处理方式。
+    if (!attachment) return true;
+
+    const ownerDoc = attachment.ownerDocument;
+
+    const attachments = [
+      ...ownerDoc.querySelectorAll('.ans-attach-ct')
+    ].filter(container =>
+      container.querySelector(
+        'iframe.ans-insertaudio, ' +
+        'iframe.ans-insertvideo-online'
+      )
+    );
+
+    function state(container) {
+      const marker = container.querySelector('.ans-job-icon');
+      const label = marker?.getAttribute('aria-label') || '';
+
+      if (
+        container.classList.contains('ans-job-finished') ||
+        label === '任务点已完成'
+      ) {
+        return 'done';
+      }
+
+      if (label === '任务点未完成') {
+        return 'pending';
+      }
+
+      return 'unknown';
+    }
+
+    // 未能确认当前任务状态时，避免自动播放。
+    if (state(attachment) !== 'pending') {
+      return false;
+    }
+
+    // 有状态不明的任务排在前面时，不猜测播放顺序。
+    for (const container of attachments) {
+      const status = state(container);
+
+      if (container === attachment) {
+        return status === 'pending';
+      }
+
+      if (status === 'pending' || status === 'unknown') {
+        return false;
+      }
+    }
+
+    return false;
+  }
+
+
+  function isClosedQuiz(doc) {
+    return [...doc.querySelectorAll('span,div,p')].some(el => {
+      if (!visible(el)) return false;
+
+      const text = (el.textContent || '')
+        .replace(/\s+/g, '')
+        .trim();
+
+      return text.length <= 100 &&
+        /已截止[，,]?不能作答/.test(text);
+    });
+  }
+
   async function worker() {
     const c = cfg();
 
@@ -2194,8 +2845,36 @@
       report('idle');
       return;
     }
+          // 已截止且不能作答的测验，不再请求答案。
+    const closedQuiz = isClosedQuiz(document);
 
-    if (c.next && taskDone()) {
+    if (
+      closedQuiz &&
+      controls(document, SUBMIT).length === 0
+    ) {
+      say('测验已截止，不能作答。');
+      report('blocked', 'quiz-closed');
+      return;
+    }
+
+          // 优先处理视频内弹出的题目。
+    const videoQuizzes = [
+      ...document.querySelectorAll('.tkItem')
+    ].filter(visible);
+
+    if (videoQuizzes.length) {
+      if (videoQuizzes.length === 1) {
+                if (!correctVideoQuiz(videoQuizzes[0])) {
+          void solveVideoQuiz(videoQuizzes[0]);
+        }
+      } else {
+        say('发现多个视频题目，请手动处理。');
+        report('blocked', 'video-quiz');
+      }
+
+      return;
+    }
+    if (c.next && taskDone() && !hasPendingTasks()) {
       say('任务点已完成，准备下一节。');
       report('done', 'task-complete');
       return;
@@ -2207,6 +2886,8 @@
       report('reading', 'empty|' + location.href);
       return;
     }
+
+    if (enterPendingSectionInCurrentFrame()) return;
 
     if (document.readyState !== 'complete') {
       say('页面正在加载。');
@@ -2240,35 +2921,66 @@
       return;
     }
 
-    const media = [...document.querySelectorAll(
-      'video,audio'
-    )].filter(visible);
 
-    if (media.length > 1) {
-      say('发现多个播放器，需要手动选择。');
-      report('blocked');
+    // 识别普通视频及 Video.js 音频。
+
+    if (!mayPlayAttachment()) {
+      say('当前媒体任务已完成，或正在等待前一个任务。');
+      report('idle');
       return;
     }
 
-    if (media.length === 1) {
-      const video = media[0];
+    const media = [...document.querySelectorAll(
+      'video,audio'
+    )].filter(el => {
+      if (el.tagName === 'VIDEO') {
+        return visible(el);
+      }
 
-      if (video.ended) {
-        say('媒体播放结束。');
-        report('done', video.currentSrc || video.src);
+      if (el.tagName === 'AUDIO') {
+        const player = el.closest('.video-js');
+
+        return visible(el) ||
+          Boolean(player && visible(player));
+      }
+
+      return false;
+    });
+
+    if (media.length) {
+      const unfinished = media.filter(el => !el.ended);
+
+      // 先处理未结束的音频，再处理未结束的视频。
+      const current =
+        unfinished.find(el => el.tagName === 'AUDIO') ||
+        unfinished.find(el => el.tagName === 'VIDEO');
+
+      if (!current) {
+        say('媒体已播放结束，等待任务点状态更新。');
+        report('blocked', 'media-ended');
         return;
       }
 
-      video.muted = c.muted;
+      current.muted = c.muted;
+      useFastestAvailableRate(current);
 
-      say('正在播放媒体。');
-      report('video');
+      const kind = current.tagName === 'AUDIO'
+        ? '音频'
+        : '视频';
 
-      if (video.paused) {
+      say('正在处理' + kind + '。');
+      report('video', kind);
+
+      if (current.paused) {
         try {
-          await video.play();
-        } catch {
-          say('请手动点击一次播放。');
+          await current.play();
+        } catch (error) {
+          say(
+            kind + '自动播放未成功，请手动点击播放按钮。\n' +
+            '原因：' + (error.message || error)
+          );
+
+          report('blocked', 'media-play');
         }
       }
 
@@ -2553,8 +3265,132 @@
     nextSection();
   }
 
+  // 使用网站实际的章节结构和待完成标记，不依赖橙色背景推测。
+  function enterDirectoryWithPendingJobs(docs) {
+    const overview = docs.find(doc =>
+      /已完成任务点\s*[：:]\s*\d+\s*\/\s*\d+/.test(doc.body?.textContent || '') &&
+      doc.querySelector('.chapter_item'));
+    if (!overview) return false;
+    const hasWork = docs.some(doc =>
+      [...doc.querySelectorAll('video,audio,.questionLi')].some(visible) ||
+      controls(doc, [...SUBMIT, ...ENTRY]).length > 0);
+    if (hasWork) return false;
+    const items = [...overview.querySelectorAll('.chapter_item')].filter(item => {
+      if (!visible(item)) return false;
+      const pending = item.querySelector('.catalog_points_yi');
+      if (!pending || !visible(pending)) return false;
+      const count = Number((pending.textContent || '').trim());
+      return Number.isFinite(count) && count > 0;
+    });
+    if (!items.length) { statusNode.textContent = '当前展开的目录中没有发现待完成小节。'; return true; }
+    const item = items[0];
+    const title = item.getAttribute('title') || item.querySelector('.clicktitle')?.textContent?.trim() || '未完成小节';
+    const id = item.id || item.querySelector('.knowledgeJobCount')?.value || title;
+    return enterOnce('section|' + overview.URL + '|' + id, item, '未完成小节：' + title);
+  }
+
+  // 在课程主页的任务列表中，先切换到章节。
+  function switchTaskPageToChapters(docs) {
+    function isActiveTask(item) {
+      const label = item.querySelector('.nav_content');
+      const nodes = [item, item.querySelector('a'), label]
+        .filter(Boolean);
+
+      for (const node of nodes) {
+        if (
+          node.getAttribute('aria-current') === 'page' ||
+          node.getAttribute('aria-selected') === 'true' ||
+          /(^|\s)(active|current|cur|selected|on)(\s|$)/
+            .test(node.getAttribute('class') || '')
+        ) {
+          return true;
+        }
+
+        const style = node.ownerDocument.defaultView
+          .getComputedStyle(node);
+
+        for (const color of [style.color, style.backgroundColor]) {
+          const rgb = color.match(
+            /rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/
+          );
+
+          if (
+            rgb &&
+            Number(rgb[3]) > Number(rgb[1]) + 10 &&
+            Number(rgb[3]) >= Number(rgb[2]) &&
+            Number(rgb[3]) >= 170
+          ) {
+            return true;
+          }
+        }
+      }
+
+      return false;
+    }
+
+    for (const doc of docs) {
+      let path;
+
+      try {
+        path = new URL(doc.URL).pathname;
+      } catch {
+        continue;
+      }
+
+      if (!/\/mooc2-ans\/mycourse\/stu\/?$/.test(path)) {
+        continue;
+      }
+
+      const taskItem = [
+        ...doc.querySelectorAll('li[dataname]')
+      ].find(item =>
+        (item.querySelector('.nav_content')?.textContent || '')
+          .trim() === '任务'
+      );
+
+      if (
+        !taskItem ||
+        !visible(taskItem) ||
+        !isActiveTask(taskItem)
+      ) {
+        continue;
+      }
+
+      const sectionItems = [
+        ...doc.querySelectorAll('li[dataname="zj"]')
+      ].filter(visible);
+
+      if (sectionItems.length !== 1) {
+        statusNode.textContent =
+          '检测到任务页，但无法唯一确认“章节”菜单。';
+        return true;
+      }
+
+      const link = sectionItems[0].querySelector(
+        'a[title="章节"][data-url="/mooc2-ans/mycourse/studentcourse"]'
+      );
+
+      if (!link || !visible(link)) {
+        statusNode.textContent =
+          '已找到章节菜单，但入口暂不可操作。';
+        return true;
+      }
+
+      return enterOnce(
+        'task-to-chapters|' + doc.URL,
+        link,
+        '章节目录'
+      );
+    }
+
+    return false;
+  }
+
+  let skippedVideoPage = '';
+  let skipVideoTimer = null;
+
   function coordinator() {
-    if (!TOP || !root) return;
+    if (!TOP || !root || document.hidden) return;
 
     const c = cfg();
     const now = Date.now();
@@ -2602,6 +3438,296 @@
       .filter(item => item.state !== 'idle');
 
     const identity = pageIdentity(docs);
+          // 已截止、没有提交按钮的测验，等待 3 秒进入下一节。
+    const closedQuizPage = docs.some(isClosedQuiz) ||
+      active.some(item => item.signature === 'quiz-closed');
+
+    const hasSubmitButton = docs.some(doc =>
+      controls(doc, SUBMIT).length > 0
+    );
+
+    if (c.next && closedQuizPage && !hasSubmitButton) {
+      scheduleNext(
+        'closed-quiz|' + identity,
+        3000,
+        '测验已截止'
+      );
+      return;
+    }
+
+    // 课件页识别后等待 3 秒进入下一节。
+    const selectedCourseware = docs.some(doc =>
+      [...doc.querySelectorAll(
+        'a,button,li,span,div,[role="tab"]'
+      )].some(el => {
+        if (!visible(el)) return false;
+        if (root && root.contains(el)) return false;
+
+        const text = textOf(el)
+          .replace(/\s+/g, '')
+          .trim();
+
+        if (!/^(?:\d+(?:\.\d+)*)*课件$/.test(text)) {
+          return false;
+        }
+
+        return (
+          el.getAttribute('aria-selected') === 'true' ||
+          /(^|\s)(active|current|on|selected)(\s|$)/i
+            .test(el.getAttribute('class') || '') ||
+          blueTab(el)
+        );
+      })
+    );
+
+    const coursewareHasQuiz = docs.some(doc =>
+      [...doc.querySelectorAll('.questionLi,.TiMu,.tkItem')]
+        .some(visible) ||
+      controls(doc, [...SUBMIT, ...ENTRY]).length > 0
+    );
+
+    if (
+      c.next &&
+      c.reading &&
+      selectedCourseware &&
+      !coursewareHasQuiz &&
+      !active.some(item => item.state === 'quiz')
+    ) {
+      scheduleNext(
+        'courseware-skip|' + identity,
+        3000,
+        '课件页'
+      );
+      return;
+    }
+
+
+    // 仅对标题为“拓展微课视频--查询”的页面生效。
+    const isQueryVideoPage = docs.some(doc =>
+      [...doc.querySelectorAll('h1,h2,h3,div,span')]
+        .some(el => {
+          if (!visible(el)) return false;
+          if (root && root.contains(el)) return false;
+
+          const text = textOf(el)
+            .replace(/\s+/g, '')
+            .trim();
+
+          return /^拓展微课视频[-—－]+查询$/.test(text);
+        })
+    );
+
+    if (c.next && isQueryVideoPage) {
+      if (
+        skippedVideoPage !== identity &&
+        !skipVideoTimer
+      ) {
+        const scheduledIdentity = identity;
+
+        statusNode.textContent =
+          '检测到拓展微课视频页，3 秒后尝试下一节。';
+
+        skipVideoTimer = setTimeout(() => {
+          skipVideoTimer = null;
+
+          if (
+            !cfg().enabled ||
+            !cfg().next ||
+            document.hidden
+          ) return;
+
+          if (
+            pageIdentity(documents()) !== scheduledIdentity
+          ) return;
+
+          if (skippedVideoPage === scheduledIdentity) {
+            return;
+          }
+
+          skippedVideoPage = scheduledIdentity;
+          nextSection();
+        }, 3000);
+
+      } else if (skippedVideoPage === identity) {
+        statusNode.textContent =
+          '已尝试进入下一节；若页面未切换，请手动检查。';
+      }
+
+      return;
+    }
+
+    if (!isQueryVideoPage && skipVideoTimer) {
+      clearTimeout(skipVideoTimer);
+      skipVideoTimer = null;
+    }
+
+          // 课件 iframe 可能没有 PPT 标签。
+    const panFrames = docs.flatMap(doc =>
+      [...doc.querySelectorAll('iframe#panView')]
+        .filter(visible)
+    );
+
+    // 兼容显示“PPT”标签的页面。
+    const pptSelected = docs.some(doc =>
+      [...doc.querySelectorAll(
+        'a,button,li,span,div,[role="tab"]'
+      )].some(el => {
+        if (!visible(el)) return false;
+
+        const text = textOf(el)
+          .replace(/\s+/g, '')
+          .trim();
+
+        if (!/^(?:\d+(?:\.\d+)*)*PPT$/i.test(text)) {
+          return false;
+        }
+
+        return (
+          el.getAttribute('aria-selected') === 'true' ||
+          /(^|\s)(active|current|on|selected)(\s|$)/i
+            .test(el.getAttribute('class') || '') ||
+          blueTab(el)
+        );
+      })
+    );
+
+    const panTaskDone =
+      docs.some(doc => taskDone(doc)) ||
+      active.some(item => item.task);
+
+    if (
+      c.next &&
+      (panFrames.length || pptSelected) &&
+      !panTaskDone
+    ) {
+      const areas = [];
+      const seenDocs = new Set();
+      let inaccessible = false;
+
+      function collectPanScrollers(doc, depth = 0) {
+        if (
+          !doc ||
+          !doc.defaultView ||
+          seenDocs.has(doc) ||
+          depth > 5
+        ) {
+          return;
+        }
+
+        seenDocs.add(doc);
+
+        // 课件可能直接使用 iframe 文档滚动。
+        const scroller = doc.scrollingElement;
+
+        if (
+          scroller &&
+          scroller.scrollHeight >
+            scroller.clientHeight + 10
+        ) {
+          areas.push(scroller);
+        }
+
+        // 也可能使用内部元素独立滚动。
+        for (const el of doc.querySelectorAll(
+          'div,section,article,main'
+        )) {
+          const style = doc.defaultView.getComputedStyle(el);
+
+          if (
+            el.clientHeight >= 100 &&
+            el.clientWidth >= 200 &&
+            el.scrollHeight > el.clientHeight + 10 &&
+            /(auto|scroll)/.test(style.overflowY)
+          ) {
+            areas.push(el);
+          }
+        }
+
+        // 检查课件内部的嵌套 iframe。
+        for (const frame of doc.querySelectorAll('iframe')) {
+          try {
+            if (frame.contentDocument) {
+              collectPanScrollers(
+                frame.contentDocument,
+                depth + 1
+              );
+            } else {
+              inaccessible = true;
+            }
+          } catch (error) {
+            inaccessible = true;
+          }
+        }
+      }
+
+      for (const frame of panFrames) {
+        try {
+          if (frame.contentDocument) {
+            collectPanScrollers(frame.contentDocument);
+          } else {
+            inaccessible = true;
+          }
+        } catch (error) {
+          inaccessible = true;
+        }
+      }
+
+      // 优先操作面积最大的课件滚动区域。
+      areas.sort((a, b) =>
+        (b.clientWidth * b.clientHeight) -
+        (a.clientWidth * a.clientHeight)
+      );
+
+      if (areas.length) {
+        const area = areas[0];
+        area.scrollTop = area.scrollHeight;
+
+        statusNode.textContent =
+          '正在滚动课件，等待任务点完成。';
+
+      } else if (inaccessible) {
+        statusNode.textContent =
+          '无法访问课件框架，请手动滚动课件。';
+
+      } else {
+        statusNode.textContent =
+          '等待课件滚动区域加载；' +
+          '如果长时间不动，请手动滚动课件。';
+      }
+
+      // 未完成之前，不让其他逻辑提前切换。
+      stableKey = '';
+      stableAt = 0;
+      return;
+    }
+
+
+    if (c.next && switchTaskPageToChapters(docs)) return;
+
+    const localDirectory = active.find(item => item.state === 'blocked' && item.signature === 'directory-local');
+    if (localDirectory) { statusNode.textContent = localDirectory.text; return; }
+
+    if (c.next && enterDirectoryWithPendingJobs(docs)) return;
+    if ((c.next || c.autoCourse) && extraRoutes(docs, active, identity)) return;
+
+    const pendingTaskCount = docs.reduce((count, doc) => {
+      return count + [
+        ...doc.querySelectorAll(
+          '.ans-job-icon[aria-label="任务点未完成"]'
+        )
+      ].filter(visible).length;
+    }, 0);
+
+    if (pendingTaskCount > 0) {
+      stableKey = '';
+      stableAt = 0;
+
+      statusNode.textContent =
+        '当前页面还有 ' + pendingTaskCount +
+        ' 个任务点未完成，等待处理。';
+
+      return;
+    }
 
     const completed =
       docs.some(doc => taskDone(doc)) ||
@@ -2631,6 +3757,63 @@
         )
       )
     );
+          // 识别当前选中的课件标签。
+    // 课件可能放在 iframe 中，不能仅凭 iframe 的存在判断仍在加载。
+    const coursewareTab = docs.some(doc =>
+      [...doc.querySelectorAll(
+        'a,button,li,span,div,[role="tab"]'
+      )].some(el => {
+        if (!visible(el)) return false;
+
+        const text = textOf(el)
+          .replace(/\s+/g, '')
+          .trim();
+
+        // 兼容“课件”“2 1.2课件”等标签。
+        if (!/^(?:\d+(?:\.\d+)*)*(?:课件|思维导图)$/i.test(text)) {
+          return false;
+        }
+
+        return (
+          el.getAttribute('aria-selected') === 'true' ||
+          /(^|\s)(active|current|on|selected)(\s|$)/i
+            .test(el.getAttribute('class') || '') ||
+          blueTab(el)
+        );
+      })
+    );
+
+    const coursewareBlocked = docs.some(doc =>
+      [...doc.querySelectorAll(
+        'video,audio,.questionLi,.tkItem'
+      )].some(visible) ||
+      controls(doc, [...SUBMIT, ...ENTRY]).length > 0 ||
+      [...doc.querySelectorAll('input')].some(input =>
+        visible(input) &&
+        /验证码/.test(
+          (input.placeholder || '') +
+          (input.getAttribute('aria-label') || '')
+        )
+      )
+    );
+
+    if (
+      c.next &&
+      c.reading &&
+      coursewareTab &&
+      !coursewareBlocked &&
+      !active.some(item =>
+        ['quiz', 'video', 'error'].includes(item.state)
+      )
+    ) {
+      scheduleNext(
+        'courseware|' + identity,
+        3000,
+        '课件页'
+      );
+      return;
+    }
+
 
     if (
       c.next &&
@@ -2727,7 +3910,7 @@
     confirmSubmission();
 
     if (c.next) {
-      if (taskDone()) {
+      if (taskDone() && !hasPendingTasks()) {
         say('任务点已完成，准备下一节。');
         report('done', 'task-complete');
 
@@ -2747,6 +3930,22 @@
 
   createPanel();
 
+  // 返回课程列表或目录后重新检测，避免沿用旧的点击记录。
+  if (TOP) {
+    let wasHidden = document.hidden;
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) { wasHidden = true; return; }
+      if (!wasHidden) return;
+      wasHidden = false;
+      enterOnce.pending = ''; enterOnce.since = 0; enterOnce.attempted = '';
+      navigation = null; stableKey = ''; stableAt = 0; reports.clear();
+      extraRoutes.closeKey = ''; extraRoutes.closeTried = false;
+      say('已返回当前页面，正在重新检测课程列表或目录。');
+      setTimeout(() => { if (!document.hidden && cfg().enabled) coordinator(); }, 3000);
+    });
+  }
+
+
   setInterval(() => {
     if (ticking) return;
 
@@ -2764,30 +3963,6 @@
 
   // 此处只检查页面、弹窗和完成状态，不是网络检测。
   setInterval(fastCheck, 500);
-
-  const observer = new MutationObserver(() => {
-    if (mutationTimer !== null) return;
-
-    mutationTimer = setTimeout(() => {
-      mutationTimer = null;
-      fastCheck();
-    }, 100);
-  });
-
-  observer.observe(document.documentElement, {
-    subtree: true,
-    childList: true,
-    characterData: true,
-    attributes: true,
-
-    attributeFilter: [
-      'class',
-      'style',
-      'hidden',
-      'aria-hidden',
-      'aria-selected'
-    ]
-  });
 
   document.addEventListener('visibilitychange', () => {
     if (!document.hidden) fastCheck();
