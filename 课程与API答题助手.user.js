@@ -3593,6 +3593,45 @@
       })
     );
 
+          // 无任务点的课件页：等待内容稳定后进入下一节。
+    const coursewareVisible = panFrames.length > 0 || pptSelected;
+
+    const hasTaskMarker = docs.some(doc =>
+      [...doc.querySelectorAll('.ans-job-icon')]
+        .some(visible)
+    );
+
+    const hasQuizOrMedia = docs.some(doc =>
+      [...doc.querySelectorAll(
+        '.questionLi,.TiMu,.tkItem,video,audio'
+      )].some(visible) ||
+      controls(doc, [...SUBMIT, ...ENTRY]).length > 0
+    );
+
+    const pagesReady = docs.every(doc =>
+      doc.readyState === 'complete'
+    );
+
+    if (
+      c.next &&
+      c.reading &&
+      coursewareVisible &&
+      pagesReady &&
+      !hasTaskMarker &&
+      !hasQuizOrMedia &&
+      !active.some(item =>
+        ['quiz', 'video', 'error'].includes(item.state)
+      )
+    ) {
+      scheduleNext(
+        'courseware-no-task|' + identity,
+        8000,
+        '无任务点课件页'
+      );
+      return;
+    }
+
+
     const panTaskDone =
       docs.some(doc => taskDone(doc)) ||
       active.some(item => item.task);
